@@ -1,0 +1,5 @@
+BOT_TOKEN=
+DB_PATH=/data/streak.db
+TIMEZONE=Europe/Berlin
+REMINDER_HOUR=20
+REMINDER_MINUTE=0

@@ -1,0 +1,184 @@
+
+import asyncio, logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, BusinessConnection, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from dotenv import load_dotenv
+
+from .config import load_config
+from .db import DB
+from .logic import today, record_message, plural
+from .ui import main_menu, choose_keyboard, contact_buttons, streak_text
+
+logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
+router=Router()
+
+async def send_business(bot, connection_id, chat_id, text, reply_markup=None):
+    return await bot.send_message(chat_id=chat_id,text=text,business_connection_id=connection_id,
+                                  parse_mode="HTML",reply_markup=reply_markup)
+
+async def owner_id_for_business(db, connection_id):
+    # connection ids are unique; SQLite query kept simple via direct connection.
+    async with db.lock:
+        c=db.conn(); r=c.execute("SELECT owner_id FROM business_connections WHERE connection_id=?",(connection_id,)).fetchone(); c.close()
+        return r["owner_id"] if r else None
+
+async def selected_contact(db, owner_id):
+    async with db.lock:
+        c=db.conn(); r=c.execute("SELECT * FROM streaks WHERE owner_id=? AND active=1 LIMIT 1",(owner_id,)).fetchone(); c.close()
+        return r
+
+@router.business_connection()
+async def on_connection(event: BusinessConnection, db: DB):
+    await db.set_connection(event.user.id,event.id,1 if event.is_enabled else 0)
+    logging.info("Business connection: owner=%s enabled=%s",event.user.id,event.is_enabled)
+
+@router.business_message()
+async def on_business_message(message: Message, bot: Bot, db: DB, cfg):
+    bc=message.business_connection_id
+    if not bc or not message.chat or message.chat.type!="private": return
+    owner=await owner_id_for_business(db,bc)
+    if not owner: return
+    if message.from_user and message.from_user.id!=owner:
+        await db.upsert_contact(owner,message.from_user.id,
+                                message.from_user.full_name,message.from_user.username)
+        st=await selected_contact(db,owner)
+        if st and st["contact_id"]==message.from_user.id:
+            day=today(cfg.timezone).isoformat()
+            days=await record_message(db,owner,message.from_user.id,day,"contact")
+            if days:
+                await bot.send_message(owner,
+                    f"🔥 <b>Огонёк продолжается!</b>\n\n"
+                    f"Вы держите огонёк <b>{days} {plural(days)}</b>.\n"
+                    f"Сегодня вы оба уже пообщались. 🔥")
+    # outgoing business message from owner: Telegram marks the sender as business account,
+    # so message.from_user can be absent/equal to owner. Treat outgoing messages as owner activity.
+    if message.from_user and message.from_user.id==owner:
+        st=await selected_contact(db,owner)
+        if st and st["active"] and st["contact_id"]==message.chat.id:
+            day=today(cfg.timezone).isoformat()
+            days=await record_message(db,owner,st["contact_id"],day,"owner")
+            if days:
+                await bot.send_message(owner,
+                    f"🔥 <b>Огонёк продолжается!</b>\n\n"
+                    f"Вы держите огонёк <b>{days} {plural(days)}</b>.\n"
+                    f"День засчитан — так держать! 🔥")
+
+@router.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
+        "🔥 <b>Огонёк</b>\n\n"
+        "Держите серию переписки с человеком.\n"
+        "Каждый календарный день засчитывается только тогда, "
+        "когда вы оба отправили хотя бы одно сообщение.\n\n"
+        "Выберите контакт, настройте огонёк и получайте уведомления.",
+        parse_mode="HTML",reply_markup=main_menu())
+
+@router.callback_query(F.data=="choose")
+async def choose(call: CallbackQuery, bot: Bot):
+    await call.message.answer("👤 Нажмите кнопку ниже и выберите человека из контактов Telegram.",
+                              reply_markup=choose_keyboard())
+    await call.answer()
+
+@router.message(F.users_shared)
+async def users_shared(message: Message, db: DB):
+    if not message.users_shared or not message.users_shared.users: return
+    u=message.users_shared.users[0]
+    owner=message.from_user.id
+    conn=await db.get_connection(owner)
+    if not conn or not conn["enabled"]:
+        await message.answer("⚠️ Сначала подключите этого бота к Telegram Business.")
+        return
+    name=" ".join(x for x in [u.first_name,u.last_name] if x) or str(u.user_id)
+    await db.upsert_contact(owner,u.user_id,name,u.username)
+    await db.set_streak(owner,u.user_id,started_on=None,last_counted_day=None,current_days=0,active=1)
+    await message.answer(f"🔥 <b>Огонёк создан!</b>\n\nКонтакт: <b>{name}</b>\n"
+                         "Серия начнёт считаться с первого дня, когда вы оба напишете друг другу.",
+                         parse_mode="HTML",reply_markup=main_menu())
+
+@router.callback_query(F.data=="status")
+async def status(call: CallbackQuery, db: DB, cfg):
+    st=await selected_contact(db,call.from_user.id)
+    if not st:
+        await call.message.edit_text("🔥 <b>Огонёк</b>\n\nВы ещё не выбрали контакт.",parse_mode="HTML",reply_markup=main_menu())
+        return await call.answer()
+    row=await db.day_row(call.from_user.id,st["contact_id"],today(cfg.timezone).isoformat())
+    async with db.lock:
+        c=db.conn(); r=c.execute("SELECT name FROM contacts WHERE owner_id=? AND contact_id=?",(call.from_user.id,st["contact_id"])).fetchone(); c.close()
+    name=r["name"] if r else str(st["contact_id"])
+    await call.message.edit_text(streak_text(name,st["current_days"],bool(row and row["owner_spoke"]),bool(row and row["contact_spoke"])),
+                                  parse_mode="HTML",reply_markup=main_menu())
+    await call.answer()
+
+@router.callback_query(F.data=="invite")
+async def invite(call: CallbackQuery, bot: Bot, db: DB):
+    st=await selected_contact(db,call.from_user.id)
+    conn=await db.get_connection(call.from_user.id)
+    if not st or not conn:
+        await call.answer("Сначала выберите контакт.",show_alert=True); return
+    text=("🔥 <b>Приглашение на огонёк</b>\n\n"
+          "Предлагаю держать огонёк вместе 🔥\n"
+          "Чтобы день засчитался, нам обоим нужно написать друг другу хотя бы одно сообщение сегодня.")
+    try:
+        await send_business(bot,conn["connection_id"],st["contact_id"],text)
+        await call.answer("Приглашение отправлено 🔥")
+    except (TelegramBadRequest,TelegramForbiddenError) as e:
+        await call.answer("Telegram не разрешил отправить приглашение. Обычно контакт должен недавно написать вам, а у бота должно быть право отвечать.",show_alert=True)
+    except Exception:
+        logging.exception("invite failed")
+        await call.answer("Не удалось отправить приглашение.",show_alert=True)
+
+@router.callback_query(F.data=="notifications")
+async def notifications(call: CallbackQuery):
+    await call.answer("Уведомления включены: после засчитанного дня и при незавершённом дне.",show_alert=True)
+
+@router.callback_query(F.data.startswith("pick:"))
+async def pick(call: CallbackQuery, db: DB):
+    cid=int(call.data.split(":")[1])
+    rows=await db.contacts(call.from_user.id,50)
+    target=next((r for r in rows if r["contact_id"]==cid),None)
+    if not target:
+        await call.answer("Контакт не найден.",show_alert=True); return
+    await db.set_streak(call.from_user.id,cid,started_on=None,last_counted_day=None,current_days=0,active=1)
+    await call.message.edit_text(f"🔥 <b>Огонёк выбран</b>\n\n{target['name'] or cid}\n\n"
+                                  "Теперь каждый день, когда вы оба пишете друг другу, серия увеличивается.",
+                                  parse_mode="HTML",reply_markup=main_menu())
+    await call.answer()
+
+async def reminder_loop(bot,db,cfg):
+    while True:
+        now=datetime.now(ZoneInfo(cfg.timezone))
+        target=now.replace(hour=cfg.reminder_hour,minute=cfg.reminder_minute,second=0,microsecond=0)
+        if target<=now: target+=timedelta(days=1)
+        await asyncio.sleep((target-now).total_seconds())
+        for st in await db.active_streaks():
+            conn=await db.get_connection(st["owner_id"])
+            if not conn or not conn["enabled"]: continue
+            row=await db.day_row(st["owner_id"],st["contact_id"],today(cfg.timezone).isoformat())
+            if row and row["counted"]: continue
+            if row and (row["owner_spoke"] or row["contact_spoke"]):
+                await bot.send_message(st["owner_id"],
+                    "⏳ <b>Огонёк ещё можно спасти!</b>\n\n"
+                    "Сегодня отметился только один из вас. Напишите друг другу до конца дня, чтобы день засчитался.",
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(st["owner_id"],
+                    "🔥 <b>Не забудьте про огонёк!</b>\n\nСегодня пока нет взаимной переписки. Напишите друг другу, чтобы сохранить серию.",
+                    parse_mode="HTML")
+
+async def main():
+    cfg=__import__("app.config",fromlist=["load_config"]).load_config()
+    db=__import__("app.db",fromlist=["DB"]).DB(cfg.db_path)
+    await db.init()
+    bot=Bot(cfg.bot_token)
+    dp=Dispatcher()
+    dp["db"]=db; dp["cfg"]=cfg
+    dp.include_router(router)
+    asyncio.create_task(reminder_loop(bot,db,cfg))
+    await dp.start_polling(bot,allowed_updates=["message","callback_query","business_connection","business_message"])
+
+if __name__=="__main__":
+    asyncio.run(main())
